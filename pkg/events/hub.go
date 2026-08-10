@@ -42,6 +42,14 @@ type Subscriber struct {
 	ch         chan Event
 	types      map[Type]struct{}
 	namespaces map[string]struct{}
+	closeOnce  sync.Once
+}
+
+// close shuts down the subscriber's channel exactly once. It is safe to
+// call concurrently from the cancel path and from broadcast's slow-
+// subscriber cleanup path.
+func (s *Subscriber) close() {
+	s.closeOnce.Do(func() { close(s.ch) })
 }
 
 // Hub fans-out normalised lifecycle events to connected subscribers.
@@ -96,7 +104,7 @@ func (h *Hub) Subscribe(types []Type, namespaces []string) (<-chan Event, func()
 		h.mu.Lock()
 		delete(h.subscribers, sub)
 		h.mu.Unlock()
-		close(sub.ch)
+		sub.close()
 	}
 	return sub.ch, cancel
 }
@@ -120,7 +128,7 @@ func (h *Hub) broadcast(evt Event) {
 				h.mu.Lock()
 				delete(h.subscribers, s)
 				h.mu.Unlock()
-				close(s.ch)
+				s.close()
 			}(sub)
 		}
 	}
