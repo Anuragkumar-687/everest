@@ -18,6 +18,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,11 +30,16 @@ import (
 	"github.com/percona/everest/api"
 	"github.com/percona/everest/pkg/accounts"
 	"github.com/percona/everest/pkg/common"
+	"github.com/percona/everest/pkg/oidc"
+	"github.com/percona/everest/pkg/session"
 )
 
 const (
 	jwtSubjectTml    = "%s:%s" // username:capability
 	jwtDefaultExpiry = time.Hour * 24
+	// jwtSSOExpiry bounds how long a disabled/revoked IdP user keeps API access, since the
+	// token is validated against the IdP only at issuance. The client silently renews it.
+	jwtSSOExpiry = time.Minute * 15
 )
 
 // CreateSession creates a new session.
@@ -65,6 +71,78 @@ func (e *EverestServer) CreateSession(ctx echo.Context) error {
 	e.attemptsStore.CleanupVisitor(ctx.RealIP())
 
 	return ctx.JSON(http.StatusOK, map[string]string{"token": jwtToken})
+}
+
+// CreateSSOSession exchanges an OIDC access token (JWT or opaque) for an Everest-signed JWT.
+// See resolveSSOIdentity for how the OIDC token is validated. The resulting Everest JWT is
+// compatible with the existing JWT middleware and session blocklist.
+func (e *EverestServer) CreateSSOSession(ctx echo.Context) error {
+	if e.oidcProvider == nil {
+		return ctx.JSON(http.StatusBadRequest, api.Error{
+			Message: new("OIDC is not configured"),
+		})
+	}
+
+	var params api.CreateSSOSessionJSONRequestBody
+	if err := ctx.Bind(&params); err != nil {
+		return err
+	}
+	if params.Token == "" {
+		return ctx.JSON(http.StatusBadRequest, api.Error{
+			Message: new("'token' is required"),
+		})
+	}
+
+	c := ctx.Request().Context()
+	userInfo, err := e.resolveSSOIdentity(c, params.Token)
+	if err != nil {
+		e.l.Debugf("SSO token exchange failed: %v", err)
+		e.ssoAttemptsStore.IncreaseTimeout(ctx.RealIP())
+		return ctx.JSON(http.StatusUnauthorized, api.Error{
+			Message: new("Invalid OIDC token"),
+		})
+	}
+
+	uniqueID, err := uuid.NewRandom()
+	if err != nil {
+		return err
+	}
+
+	issuerURL := e.oidcProvider.OriginalIssuer
+	if issuerURL == "" {
+		issuerURL = e.oidcProvider.Issuer
+	}
+	secondsBeforeExpiry := int64(jwtSSOExpiry.Seconds())
+
+	jwtToken, err := e.sessionMgr.CreateSSO(userInfo.Subject, secondsBeforeExpiry, uniqueID.String(), issuerURL, session.SSOIdentity{
+		Email:             userInfo.Email,
+		Name:              userInfo.Name,
+		PreferredUsername: userInfo.PreferredUsername,
+		Groups:            userInfo.Groups,
+	})
+	if err != nil {
+		return err
+	}
+
+	e.ssoAttemptsStore.CleanupVisitor(ctx.RealIP())
+
+	return ctx.JSON(http.StatusOK, map[string]string{"token": jwtToken})
+}
+
+// resolveSSOIdentity validates an OIDC access token and returns the identity it represents.
+// A JWT signed by the provider is verified locally against its JWKS, the same check the JWT
+// middleware applies; this keeps working for IdPs whose UserInfo endpoint rejects tokens
+// minted for a custom API audience (e.g. Entra ID). Opaque or locally unverifiable tokens
+// (e.g. Authentik HS256 tokens) are validated by the provider's UserInfo endpoint instead.
+func (e *EverestServer) resolveSSOIdentity(ctx context.Context, token string) (*oidc.UserInfo, error) {
+	if e.oidcKeyFunc != nil {
+		info, err := oidc.UserInfoFromJWT(token, e.oidcKeyFunc)
+		if err == nil {
+			return info, nil
+		}
+		e.l.Debugf("SSO token is not a locally verifiable JWT, using UserInfo: %v", err)
+	}
+	return oidc.FetchUserInfo(ctx, e.oidcProvider.UserInfoURL, token)
 }
 
 // DeleteSession invalidates the user token by adding it to the blocklist.
