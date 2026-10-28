@@ -444,12 +444,9 @@ func TestBlocklist_IsBlocked(t *testing.T) {
 // Secret update fails, Add must return the error rather than swallow it, and
 // the token must not be persisted to the blocklist Secret.
 //
-// This branch already carries the fix (#2086); this closes the coverage gap
-// that let the original bug (#2085) ship and its missing v2 backport go
-// unnoticed (#2766). It mirrors the regression test added on the v2 line in
-// #2769. On the unfixed code Add returns the nil `err` from the earlier
-// GetSecret instead of the update error, so a failed write is reported as
-// success and the token is never blocklisted.
+// Regression test for #2085: Add returned nil when the Secret update failed,
+// so the failed write was reported as success and the token was never
+// blocklisted.
 func TestTokenStore_Add_UpdateFailure(t *testing.T) {
 	t.Parallel()
 
